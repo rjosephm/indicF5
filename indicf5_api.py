@@ -48,6 +48,49 @@ def health():
     }
 
 
+def trim_leading_noise(audio: np.ndarray, sample_rate: int = 24000) -> np.ndarray:
+    """Trim sustained low-level noise before speech, retaining a short onset buffer.
+
+    This is a conservative amplitude-based heuristic, not a general denoiser.
+    It only searches the first two seconds and leaves 60 ms before the detected onset.
+    """
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return audio
+
+    frame_size = max(1, int(sample_rate * 0.020))  # 20 ms frames
+    search_samples = min(audio.size, int(sample_rate * 2.0))
+    segment = audio[:search_samples]
+    frame_count = (segment.size + frame_size - 1) // frame_size
+    rms = np.zeros(frame_count, dtype=np.float32)
+
+    for i in range(frame_count):
+        frame = segment[i * frame_size:(i + 1) * frame_size]
+        if frame.size:
+            rms[i] = np.sqrt(np.mean(np.square(frame), dtype=np.float64))
+
+    if rms.size < 4:
+        return audio
+
+    threshold = max(0.0025, float(rms.max()) * 0.08)
+    active = rms >= threshold
+    onset_frame = None
+    for i in range(max(0, len(active) - 2)):
+        if active[i] and active[i + 1] and active[i + 2]:
+            onset_frame = i
+            break
+
+    if onset_frame is None:
+        return audio
+
+    onset_sample = onset_frame * frame_size
+    keep_from = max(0, onset_sample - int(sample_rate * 0.060))
+    # Avoid trimming tiny amounts that are unlikely to be meaningful.
+    if keep_from < int(sample_rate * 0.020):
+        return audio
+    return audio[keep_from:]
+
+
 @app.post("/generate")
 def generate(req: SpeechRequest):
     if model is None:
@@ -74,6 +117,9 @@ def generate(req: SpeechRequest):
         audio = np.asarray(audio).squeeze()
         if audio.size == 0 or audio.ndim != 1:
             raise RuntimeError("Model returned invalid audio")
+
+        # Remove sustained low-level noise at the start of generated speech.
+        audio = trim_leading_noise(audio, sample_rate=24000)
 
         output_dir = BASE / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
